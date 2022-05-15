@@ -1,612 +1,242 @@
-#include "uview/fitz.h"
+/*
+ * The copyright in this software is being made available under the 2-clauses 
+ * BSD License, included below. This software may be subject to other third 
+ * party and contributor rights, including patent rights, and no such rights
+ * are granted under this license.
+ *
+ * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS `AS IS'
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
-#define SANE_DPI 72.0f
-#define INSANE_DPI 4800.0f
+#include "opj_includes.h"
 
-fz_image *
-fz_keep_image(fz_context *ctx, fz_image *image)
-{
-	return fz_keep_storable(ctx, &image->storable);
+opj_image_t* opj_image_create0(void) {
+	opj_image_t *image = (opj_image_t*)opj_calloc(1, sizeof(opj_image_t));
+	return image;
 }
 
-void
-fz_drop_image(fz_context *ctx, fz_image *image)
-{
-	fz_drop_storable(ctx, &image->storable);
-}
+opj_image_t* OPJ_CALLCONV opj_image_create(OPJ_UINT32 numcmpts, opj_image_cmptparm_t *cmptparms, OPJ_COLOR_SPACE clrspc) {
+	OPJ_UINT32 compno;
+	opj_image_t *image = NULL;
 
-typedef struct fz_image_key_s fz_image_key;
-
-struct fz_image_key_s {
-	int refs;
-	fz_image *image;
-	int l2factor;
-};
-
-static int
-fz_make_hash_image_key(fz_context *ctx, fz_store_hash *hash, void *key_)
-{
-	fz_image_key *key = (fz_image_key *)key_;
-	hash->u.pi.ptr = key->image;
-	hash->u.pi.i = key->l2factor;
-	return 1;
-}
-
-static void *
-fz_keep_image_key(fz_context *ctx, void *key_)
-{
-	fz_image_key *key = (fz_image_key *)key_;
-	return fz_keep_imp(ctx, key, &key->refs);
-}
-
-static void
-fz_drop_image_key(fz_context *ctx, void *key_)
-{
-	fz_image_key *key = (fz_image_key *)key_;
-	if (fz_drop_imp(ctx, key, &key->refs))
-	{
-		fz_drop_image(ctx, key->image);
-		fz_free(ctx, key);
-	}
-}
-
-static int
-fz_cmp_image_key(fz_context *ctx, void *k0_, void *k1_)
-{
-	fz_image_key *k0 = (fz_image_key *)k0_;
-	fz_image_key *k1 = (fz_image_key *)k1_;
-	return k0->image == k1->image && k0->l2factor == k1->l2factor;
-}
-
-static void
-fz_print_image(fz_context *ctx, fz_output *out, void *key_)
-{
-	fz_image_key *key = (fz_image_key *)key_;
-	fz_printf(ctx, out, "(image %d x %d sf=%d) ", key->image->w, key->image->h, key->l2factor);
-}
-
-static fz_store_type fz_image_store_type =
-{
-	fz_make_hash_image_key,
-	fz_keep_image_key,
-	fz_drop_image_key,
-	fz_cmp_image_key,
-	fz_print_image
-};
-
-static void
-fz_mask_color_key(fz_pixmap *pix, int n, const int *colorkey)
-{
-	unsigned char *p = pix->samples;
-	int len = pix->w * pix->h;
-	int k, t;
-	while (len--)
-	{
-		t = 1;
-		for (k = 0; k < n; k++)
-			if (p[k] < colorkey[k * 2] || p[k] > colorkey[k * 2 + 1])
-				t = 0;
-		if (t)
-			for (k = 0; k < pix->n; k++)
-				p[k] = 0;
-		p += pix->n;
-	}
-}
-
-static void
-fz_unblend_masked_tile(fz_context *ctx, fz_pixmap *tile, fz_image *image)
-{
-	fz_pixmap *mask = fz_get_pixmap_from_image(ctx, image->mask, tile->w, tile->h);
-	unsigned char *s = mask->samples, *end = s + mask->w * mask->h;
-	unsigned char *d = tile->samples;
-	int k;
-
-	if (tile->w != mask->w || tile->h != mask->h)
-	{
-		fz_warn(ctx, "mask must be of same size as image for /Matte");
-		fz_drop_pixmap(ctx, mask);
-		return;
-	}
-
-	for (; s < end; s++, d += tile->n)
-	{
-		if (*s == 0)
-			for (k = 0; k < image->n; k++)
-				d[k] = image->colorkey[k];
-		else
-			for (k = 0; k < image->n; k++)
-				d[k] = fz_clampi(image->colorkey[k] + (d[k] - image->colorkey[k]) * 255 / *s, 0, 255);
-	}
-
-	fz_drop_pixmap(ctx, mask);
-}
-
-fz_pixmap *
-fz_decomp_image_from_stream(fz_context *ctx, fz_stream *stm, fz_image *image, int indexed, int l2factor)
-{
-	fz_pixmap *tile = NULL;
-	int stride, len, i;
-	unsigned char *samples = NULL;
-	int f = 1<<l2factor;
-	int w = (image->w + f-1) >> l2factor;
-	int h = (image->h + f-1) >> l2factor;
-
-	fz_var(tile);
-	fz_var(samples);
-
-	fz_try(ctx)
-	{
-		tile = fz_new_pixmap(ctx, image->colorspace, w, h);
-		tile->interpolate = image->interpolate;
-
-		stride = (w * image->n * image->bpc + 7) / 8;
-
-		samples = fz_malloc_array(ctx, h, stride);
-
-		len = fz_read(ctx, stm, samples, h * stride);
-
-		/* Pad truncated images */
-		if (len < stride * h)
-		{
-			fz_warn(ctx, "padding truncated image");
-			memset(samples + len, 0, stride * h - len);
+	image = (opj_image_t*) opj_calloc(1, sizeof(opj_image_t));
+	if(image) {
+		image->color_space = clrspc;
+		image->numcomps = numcmpts;
+		/* allocate memory for the per-component information */
+		image->comps = (opj_image_comp_t*)opj_calloc(1,image->numcomps * sizeof(opj_image_comp_t));
+		if(!image->comps) {
+			/* TODO replace with event manager, breaks API */
+			/* fprintf(stderr,"Unable to allocate memory for image.\n"); */
+			opj_image_destroy(image);
+			return NULL;
 		}
-
-		/* Invert 1-bit image masks */
-		if (image->imagemask)
-		{
-			/* 0=opaque and 1=transparent so we need to invert */
-			unsigned char *p = samples;
-			len = h * stride;
-			for (i = 0; i < len; i++)
-				p[i] = ~p[i];
+		/* create the individual image components */
+		for(compno = 0; compno < numcmpts; compno++) {
+			opj_image_comp_t *comp = &image->comps[compno];
+			comp->dx = cmptparms[compno].dx;
+			comp->dy = cmptparms[compno].dy;
+			comp->w = cmptparms[compno].w;
+			comp->h = cmptparms[compno].h;
+			comp->x0 = cmptparms[compno].x0;
+			comp->y0 = cmptparms[compno].y0;
+			comp->prec = cmptparms[compno].prec;
+			comp->bpp = cmptparms[compno].bpp;
+			comp->sgnd = cmptparms[compno].sgnd;
+			comp->data = (OPJ_INT32*) opj_calloc(comp->w * comp->h, sizeof(OPJ_INT32));
+			if(!comp->data) {
+				/* TODO replace with event manager, breaks API */
+				/* fprintf(stderr,"Unable to allocate memory for image.\n"); */
+				opj_image_destroy(image);
+				return NULL;
+			}
 		}
-
-		fz_unpack_tile(ctx, tile, samples, image->n, image->bpc, stride, indexed);
-
-		fz_free(ctx, samples);
-		samples = NULL;
-
-		/* color keyed transparency */
-		if (image->usecolorkey && !image->mask)
-			fz_mask_color_key(tile, image->n, image->colorkey);
-
-		if (indexed)
-		{
-			fz_pixmap *conv;
-			fz_decode_indexed_tile(ctx, tile, image->decode, (1 << image->bpc) - 1);
-			conv = fz_expand_indexed_pixmap(ctx, tile);
-			fz_drop_pixmap(ctx, tile);
-			tile = conv;
-		}
-		else
-		{
-			fz_decode_tile(ctx, tile, image->decode);
-		}
-
-		/* pre-blended matte color */
-		if (image->usecolorkey && image->mask)
-			fz_unblend_masked_tile(ctx, tile, image);
-	}
-	fz_always(ctx)
-	{
-		fz_drop_stream(ctx, stm);
-	}
-	fz_catch(ctx)
-	{
-		if (tile)
-			fz_drop_pixmap(ctx, tile);
-		fz_free(ctx, samples);
-
-		fz_rethrow(ctx);
 	}
 
-	return tile;
+	return image;
 }
 
-void
-fz_drop_image_imp(fz_context *ctx, fz_storable *image_)
-{
-	fz_image *image = (fz_image *)image_;
+void OPJ_CALLCONV opj_image_destroy(opj_image_t *image) {
+	if(image) {
+		if(image->comps) {
+			OPJ_UINT32 compno;
 
-	if (image == NULL)
-		return;
-	fz_drop_pixmap(ctx, image->tile);
-	fz_drop_compressed_buffer(ctx, image->buffer);
-	fz_drop_colorspace(ctx, image->colorspace);
-	fz_drop_image(ctx, image->mask);
-	fz_free(ctx, image);
-}
-
-static fz_pixmap *
-standard_image_get_pixmap(fz_context *ctx, fz_image *image, int w, int h, int *l2factor)
-{
-	int native_l2factor;
-	fz_stream *stm;
-	int indexed;
-	fz_pixmap *tile;
-
-	/* We need to make a new one. */
-	/* First check for ones that we can't decode using streams */
-	switch (image->buffer->params.type)
-	{
-	case FZ_IMAGE_PNG:
-		tile = fz_load_png(ctx, image->buffer->buffer->data, image->buffer->buffer->len);
-		break;
-	case FZ_IMAGE_GIF:
-		tile = fz_load_gif(ctx, image->buffer->buffer->data, image->buffer->buffer->len);
-		break;
-	case FZ_IMAGE_BMP:
-		tile = fz_load_bmp(ctx, image->buffer->buffer->data, image->buffer->buffer->len);
-		break;
-	case FZ_IMAGE_TIFF:
-		tile = fz_load_tiff(ctx, image->buffer->buffer->data, image->buffer->buffer->len);
-		break;
-	case FZ_IMAGE_JXR:
-		tile = fz_load_jxr(ctx, image->buffer->buffer->data, image->buffer->buffer->len);
-		break;
-	case FZ_IMAGE_JPEG:
-		/* Scan JPEG stream and patch missing height values in header */
-		{
-			unsigned char *s = image->buffer->buffer->data;
-			unsigned char *e = s + image->buffer->buffer->len;
-			unsigned char *d;
-			for (d = s + 2; s < d && d < e - 9 && d[0] == 0xFF; d += (d[2] << 8 | d[3]) + 2)
-			{
-				if (d[1] < 0xC0 || (0xC3 < d[1] && d[1] < 0xC9) || 0xCB < d[1])
-					continue;
-				if ((d[5] == 0 && d[6] == 0) || ((d[5] << 8) | d[6]) > image->h)
-				{
-					d[5] = (image->h >> 8) & 0xFF;
-					d[6] = image->h & 0xFF;
+			/* image components */
+			for(compno = 0; compno < image->numcomps; compno++) {
+				opj_image_comp_t *image_comp = &(image->comps[compno]);
+				if(image_comp->data) {
+					opj_free(image_comp->data);
 				}
 			}
-		}
-		/* fall through */
-
-	default:
-		native_l2factor = l2factor ? *l2factor : 0;
-		stm = fz_open_image_decomp_stream_from_buffer(ctx, image->buffer, l2factor);
-		if (l2factor)
-			native_l2factor -= *l2factor;
-
-		indexed = fz_colorspace_is_indexed(ctx, image->colorspace);
-		tile = fz_decomp_image_from_stream(ctx, stm, image, indexed, native_l2factor);
-
-		/* CMYK JPEGs in XPS documents have to be inverted */
-		if (image->invert_cmyk_jpeg &&
-			image->buffer->params.type == FZ_IMAGE_JPEG &&
-			image->colorspace == fz_device_cmyk(ctx) &&
-			image->buffer->params.u.jpeg.color_transform)
-		{
-			fz_invert_pixmap(ctx, tile);
+			opj_free(image->comps);
 		}
 
-		break;
-	}
-
-	return tile;
-}
-
-fz_pixmap *
-fz_get_pixmap_from_image(fz_context *ctx, fz_image *image, int w, int h)
-{
-	fz_pixmap *tile;
-	int l2factor, l2factor_remaining;
-	fz_image_key key;
-	fz_image_key *keyp;
-
-	if (!image)
-		return NULL;
-
-	/* 'Simple' images created direct from pixmaps will have no buffer
-	 * of compressed data. We cannot do any better than just returning
-	 * a pointer to the original 'tile'.
-	 *
-	 * Note, that we can get image->tile != NULL for jpeg 2000 images
-	 * with masks applied, so we need both parts of the following test.
-	 */
-	if (image->buffer == NULL && image->tile != NULL)
-		return fz_keep_pixmap(ctx, image->tile); /* That's all we can give you! */
-
-	/* Ensure our expectations for tile size are reasonable */
-	if (w < 0 || w > image->w)
-		w = image->w;
-	if (h < 0 || h > image->h)
-		h = image->h;
-
-	/* What is our ideal factor? We search for the largest factor where
-	 * we can subdivide and stay larger than the required size. We add
-	 * a fudge factor of +2 here to allow for the possibility of
-	 * expansion due to grid fitting. */
-	if (w == 0 || h == 0)
-		l2factor = 0;
-	else
-		for (l2factor=0; image->w>>(l2factor+1) >= w+2 && image->h>>(l2factor+1) >= h+2 && l2factor < 6; l2factor++);
-
-	/* Can we find any suitable tiles in the cache? */
-	key.refs = 1;
-	key.image = image;
-	key.l2factor = l2factor;
-	do
-	{
-		tile = fz_find_item(ctx, fz_drop_pixmap_imp, &key, &fz_image_store_type);
-		if (tile)
-			return tile;
-		key.l2factor--;
-	}
-	while (key.l2factor >= 0);
-
-	/* We'll have to decode the image; request the correct amount of
-	 * downscaling. */
-	l2factor_remaining = l2factor;
-	tile = image->get_pixmap(ctx, image, w, h, &l2factor_remaining);
-
-	/* l2factor_remaining is updated to the amount of subscaling left to do */
-	assert(l2factor_remaining >= 0 && l2factor_remaining <= 6);
-	if (l2factor_remaining)
-	{
-		fz_subsample_pixmap(ctx, tile, l2factor_remaining);
-	}
-
-	/* Now we try to cache the pixmap. Any failure here will just result
-	 * in us not caching. */
-	fz_var(keyp);
-	fz_try(ctx)
-	{
-		fz_pixmap *existing_tile;
-
-		keyp = fz_malloc_struct(ctx, fz_image_key);
-		keyp->refs = 1;
-		keyp->image = fz_keep_image(ctx, image);
-		keyp->l2factor = l2factor;
-		existing_tile = fz_store_item(ctx, keyp, tile, fz_pixmap_size(ctx, tile), &fz_image_store_type);
-		if (existing_tile)
-		{
-			/* We already have a tile. This must have been produced by a
-			 * racing thread. We'll throw away ours and use that one. */
-			fz_drop_pixmap(ctx, tile);
-			tile = existing_tile;
+		if(image->icc_profile_buf) {
+			opj_free(image->icc_profile_buf);
 		}
-	}
-	fz_always(ctx)
-	{
-		fz_drop_image_key(ctx, keyp);
-	}
-	fz_catch(ctx)
-	{
-		/* Do nothing */
-	}
 
-	return tile;
+		opj_free(image);
+	}
 }
 
-fz_image *
-fz_new_image_from_pixmap(fz_context *ctx, fz_pixmap *pixmap, fz_image *mask)
+/**
+ * Updates the components characteristics of the image from the coding parameters.
+ *
+ * @param p_image_header	the image header to update.
+ * @param p_cp				the coding parameters from which to update the image.
+ */
+void opj_image_comp_header_update(opj_image_t * p_image_header, const struct opj_cp * p_cp)
 {
-	fz_image *image;
+	OPJ_UINT32 i, l_width, l_height;
+	OPJ_UINT32 l_x0, l_y0, l_x1, l_y1;
+	OPJ_UINT32 l_comp_x0, l_comp_y0, l_comp_x1, l_comp_y1;
+	opj_image_comp_t* l_img_comp = NULL;
 
-	assert(mask == NULL || mask->mask == NULL);
+	l_x0 = opj_uint_max(p_cp->tx0 , p_image_header->x0);
+	l_y0 = opj_uint_max(p_cp->ty0 , p_image_header->y0);
+	l_x1 = p_cp->tx0 + (p_cp->tw - 1U) * p_cp->tdx; /* validity of p_cp members used here checked in opj_j2k_read_siz. Can't overflow. */
+	l_y1 = p_cp->ty0 + (p_cp->th - 1U) * p_cp->tdy; /* can't overflow */
+	l_x1 = opj_uint_min(opj_uint_adds(l_x1, p_cp->tdx), p_image_header->x1); /* use add saturated to prevent overflow */
+	l_y1 = opj_uint_min(opj_uint_adds(l_y1, p_cp->tdy), p_image_header->y1); /* use add saturated to prevent overflow */
 
-	fz_try(ctx)
-	{
-		image = fz_malloc_struct(ctx, fz_image);
-		FZ_INIT_STORABLE(image, 1, fz_drop_image_imp);
-		image->w = pixmap->w;
-		image->h = pixmap->h;
-		image->n = pixmap->n;
-		image->colorspace = fz_keep_colorspace(ctx, pixmap->colorspace);
-		image->invert_cmyk_jpeg = 1;
-		image->bpc = 8;
-		image->buffer = NULL;
-		image->get_pixmap = NULL;
-		image->xres = pixmap->xres;
-		image->yres = pixmap->yres;
-		image->tile = fz_keep_pixmap(ctx, pixmap);
-		image->mask = mask;
+	l_img_comp = p_image_header->comps;
+	for	(i = 0; i < p_image_header->numcomps; ++i) {
+		l_comp_x0 = opj_uint_ceildiv(l_x0, l_img_comp->dx);
+		l_comp_y0 = opj_uint_ceildiv(l_y0, l_img_comp->dy);
+		l_comp_x1 = opj_uint_ceildiv(l_x1, l_img_comp->dx);
+		l_comp_y1 = opj_uint_ceildiv(l_y1, l_img_comp->dy);
+		l_width   = opj_uint_ceildivpow2(l_comp_x1 - l_comp_x0, l_img_comp->factor);
+		l_height  = opj_uint_ceildivpow2(l_comp_y1 - l_comp_y0, l_img_comp->factor);
+		l_img_comp->w = l_width;
+		l_img_comp->h = l_height;
+		l_img_comp->x0 = l_comp_x0;
+		l_img_comp->y0 = l_comp_y0;
+		++l_img_comp;
 	}
-	fz_catch(ctx)
-	{
-		fz_drop_image(ctx, mask);
-		fz_rethrow(ctx);
-	}
-	return image;
 }
 
-fz_image *
-fz_new_image(fz_context *ctx, int w, int h, int bpc, fz_colorspace *colorspace,
-	int xres, int yres, int interpolate, int imagemask, float *decode,
-	int *colorkey, fz_compressed_buffer *buffer, fz_image *mask)
+
+/**
+ * Copy only header of image and its component header (no data are copied)
+ * if dest image have data, they will be freed
+ *
+ * @param	p_image_src		the src image
+ * @param	p_image_dest	the dest image
+ *
+ */
+void opj_copy_image_header(const opj_image_t* p_image_src, opj_image_t* p_image_dest)
 {
-	fz_image *image;
+	OPJ_UINT32 compno;
 
-	assert(mask == NULL || mask->mask == NULL);
+	/* preconditions */
+	assert(p_image_src != 00);
+	assert(p_image_dest != 00);
 
-	fz_try(ctx)
-	{
-		image = fz_malloc_struct(ctx, fz_image);
-		FZ_INIT_STORABLE(image, 1, fz_drop_image_imp);
-		image->get_pixmap = standard_image_get_pixmap;
-		image->w = w;
-		image->h = h;
-		image->xres = xres;
-		image->yres = yres;
-		image->bpc = bpc;
-		image->n = (colorspace ? colorspace->n : 1);
-		image->colorspace = colorspace;
-		image->invert_cmyk_jpeg = 1;
-		image->interpolate = interpolate;
-		image->imagemask = imagemask;
-		image->usecolorkey = (colorkey != NULL);
-		if (colorkey)
-			memcpy(image->colorkey, colorkey, sizeof(int)*image->n*2);
-		if (decode)
-			memcpy(image->decode, decode, sizeof(float)*image->n*2);
-		else
-		{
-			float maxval = fz_colorspace_is_indexed(ctx, colorspace) ? (1 << bpc) - 1 : 1;
-			int i;
-			for (i = 0; i < image->n; i++)
-			{
-				image->decode[2*i] = 0;
-				image->decode[2*i+1] = maxval;
+	p_image_dest->x0 = p_image_src->x0;
+	p_image_dest->y0 = p_image_src->y0;
+	p_image_dest->x1 = p_image_src->x1;
+	p_image_dest->y1 = p_image_src->y1;
+
+	if (p_image_dest->comps){
+		for(compno = 0; compno < p_image_dest->numcomps; compno++) {
+			opj_image_comp_t *image_comp = &(p_image_dest->comps[compno]);
+			if(image_comp->data) {
+				opj_free(image_comp->data);
 			}
 		}
-		image->mask = mask;
-		image->buffer = buffer;
-	}
-	fz_catch(ctx)
-	{
-		fz_drop_compressed_buffer(ctx, buffer);
-		fz_rethrow(ctx);
+		opj_free(p_image_dest->comps);
+		p_image_dest->comps = NULL;
 	}
 
-	return image;
-}
+	p_image_dest->numcomps = p_image_src->numcomps;
 
-fz_image *
-fz_new_image_from_data(fz_context *ctx, unsigned char *data, int len)
-{
-	fz_buffer *buffer = NULL;
-	fz_image *image;
-
-	fz_var(buffer);
-	fz_var(data);
-
-	fz_try(ctx)
-	{
-		buffer = fz_new_buffer_from_data(ctx, data, len);
-		data = NULL;
-		image = fz_new_image_from_buffer(ctx, buffer);
-	}
-	fz_always(ctx)
-	{
-		fz_drop_buffer(ctx, buffer);
-	}
-	fz_catch(ctx)
-	{
-		fz_free(ctx, data);
-		fz_rethrow(ctx);
+	p_image_dest->comps = (opj_image_comp_t*) opj_malloc(p_image_dest->numcomps * sizeof(opj_image_comp_t));
+	if (!p_image_dest->comps){
+		p_image_dest->comps = NULL;
+		p_image_dest->numcomps = 0;
+		return;
 	}
 
-	return image;
-}
+	for (compno=0; compno < p_image_dest->numcomps; compno++){
+		memcpy( &(p_image_dest->comps[compno]),
+				&(p_image_src->comps[compno]),
+				sizeof(opj_image_comp_t));
+		p_image_dest->comps[compno].data = NULL;
+	}
 
-fz_image *
-fz_new_image_from_buffer(fz_context *ctx, fz_buffer *buffer)
-{
-	fz_compressed_buffer *bc = NULL;
-	int w, h, xres, yres;
-	fz_colorspace *cspace;
-	int len = buffer->len;
-	unsigned char *buf = buffer->data;
+	p_image_dest->color_space = p_image_src->color_space;
+	p_image_dest->icc_profile_len = p_image_src->icc_profile_len;
 
-	fz_var(bc);
-
-	fz_try(ctx)
-	{
-		if (len < 8)
-			fz_throw(ctx, FZ_ERROR_GENERIC, "unknown image file format");
-
-		bc = fz_malloc_struct(ctx, fz_compressed_buffer);
-		bc->buffer = fz_keep_buffer(ctx, buffer);
-
-		if (buf[0] == 0xff && buf[1] == 0xd8)
-		{
-			bc->params.type = FZ_IMAGE_JPEG;
-			bc->params.u.jpeg.color_transform = -1;
-			fz_load_jpeg_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
+	if (p_image_dest->icc_profile_len) {
+		p_image_dest->icc_profile_buf = (OPJ_BYTE*)opj_malloc(p_image_dest->icc_profile_len);
+		if (!p_image_dest->icc_profile_buf){
+			p_image_dest->icc_profile_buf = NULL;
+			p_image_dest->icc_profile_len = 0;
+			return;
 		}
-		else if (memcmp(buf, "\211PNG\r\n\032\n", 8) == 0)
-		{
-			bc->params.type = FZ_IMAGE_PNG;
-			fz_load_png_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
-		}
-		else if (memcmp(buf, "II", 2) == 0 && buf[2] == 0xBC)
-		{
-			bc->params.type = FZ_IMAGE_JXR;
-			fz_load_jxr_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
-		}
-		else if (memcmp(buf, "MM", 2) == 0 || memcmp(buf, "II", 2) == 0)
-		{
-			bc->params.type = FZ_IMAGE_TIFF;
-			fz_load_tiff_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
-		}
-		else if (memcmp(buf, "GIF", 3) == 0)
-		{
-			bc->params.type = FZ_IMAGE_GIF;
-			fz_load_gif_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
-		}
-		else if (memcmp(buf, "BM", 2) == 0)
-		{
-			bc->params.type = FZ_IMAGE_BMP;
-			fz_load_bmp_info(ctx, buf, len, &w, &h, &xres, &yres, &cspace);
+		memcpy( p_image_dest->icc_profile_buf,
+				p_image_src->icc_profile_buf,
+				p_image_src->icc_profile_len);
 		}
 		else
-			fz_throw(ctx, FZ_ERROR_GENERIC, "unknown image file format");
-	}
-	fz_catch(ctx)
-	{
-		fz_drop_compressed_buffer(ctx, bc);
-		fz_rethrow(ctx);
-	}
+			p_image_dest->icc_profile_buf = NULL;
 
-	return fz_new_image(ctx, w, h, 8, cspace, xres, yres, 0, 0, NULL, NULL, bc, NULL);
+	return;
 }
 
-fz_image *
-fz_new_image_from_file(fz_context *ctx, const char *path)
-{
-	fz_buffer *buffer;
-	fz_image *image;
+opj_image_t* OPJ_CALLCONV opj_image_tile_create(OPJ_UINT32 numcmpts, opj_image_cmptparm_t *cmptparms, OPJ_COLOR_SPACE clrspc) {
+	OPJ_UINT32 compno;
+	opj_image_t *image = 00;
 
-	buffer = fz_read_file(ctx, path);
-	fz_try(ctx)
-		image = fz_new_image_from_buffer(ctx, buffer);
-	fz_always(ctx)
-		fz_drop_buffer(ctx, buffer);
-	fz_catch(ctx)
-		fz_rethrow(ctx);
+	image = (opj_image_t*) opj_calloc(1,sizeof(opj_image_t));
+	if (image)
+	{
+		
+		image->color_space = clrspc;
+		image->numcomps = numcmpts;
+		
+		/* allocate memory for the per-component information */
+		image->comps = (opj_image_comp_t*)opj_calloc(image->numcomps, sizeof(opj_image_comp_t));
+		if (!image->comps) {
+			opj_image_destroy(image);
+			return 00;
+		}
+		
+		/* create the individual image components */
+		for(compno = 0; compno < numcmpts; compno++) {
+			opj_image_comp_t *comp = &image->comps[compno];
+			comp->dx = cmptparms[compno].dx;
+			comp->dy = cmptparms[compno].dy;
+			comp->w = cmptparms[compno].w;
+			comp->h = cmptparms[compno].h;
+			comp->x0 = cmptparms[compno].x0;
+			comp->y0 = cmptparms[compno].y0;
+			comp->prec = cmptparms[compno].prec;
+			comp->sgnd = cmptparms[compno].sgnd;
+			comp->data = 0;
+		}
+	}
 
 	return image;
-}
-
-void
-fz_image_resolution(fz_image *image, int *xres, int *yres)
-{
-	*xres = image->xres;
-	*yres = image->yres;
-	if (*xres < 0 || *yres < 0 || (*xres == 0 && *yres == 0))
-	{
-		/* If neither xres or yres is sane, pick a sane value */
-		*xres = SANE_DPI; *yres = SANE_DPI;
-	}
-	else if (*xres == 0)
-	{
-		*xres = *yres;
-	}
-	else if (*yres == 0)
-	{
-		*yres = *xres;
-	}
-
-	/* Scale xres and yres up until we get beleivable values */
-	if (*xres < SANE_DPI || *yres < SANE_DPI || *xres > INSANE_DPI || *yres > INSANE_DPI)
-	{
-		if (*xres == *yres)
-		{
-			*xres = SANE_DPI;
-			*yres = SANE_DPI;
-		}
-		else if (*xres < *yres)
-		{
-			*yres = *yres * SANE_DPI / *xres;
-			*xres = SANE_DPI;
-		}
-		else
-		{
-			*xres = *xres * SANE_DPI / *yres;
-			*yres = SANE_DPI;
-		}
-	}
 }
